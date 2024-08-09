@@ -90,6 +90,8 @@ log-debug "START_DATE=${START_DATE}"
 log-debug "END_DATE=${END_DATE}"
 
 
+
+
 check-api-status() {
   # API status validation.
   #
@@ -213,6 +215,31 @@ trigger_ocp_ingest() {
       fi
     done
 
+    check_has_data() {
+        local source_name=$1
+        response=$(curl -s http://localhost:8000/api/cost-management/v1/sources/)
+        has_data=$(echo "$response" | jq -r --arg source_name "$source_name" '.data[] | select(.name == $source_name) | .has_data')
+    }
+
+    local max_retries=100
+    local retries=0
+
+    while [ "$retries" -lt "$max_retries" ]; do
+      check_has_data "$1"
+
+      if [ "$has_data" == "true" ]; then
+        log-info "has_data is true for source_name $1, proceeding."
+        break
+      else
+        retries=$((retries + 1))
+        local wait_time=$((RANDOM % 10 + 1))
+        log-info "has_data is false for source_name $1, retrying in $wait_time seconds... (Attempt $retries/$max_retries)"
+        sleep "$wait_time"
+      fi
+    done
+    if [ "$has_data" != "true" ]; then
+        log-err "Failed to find has_data=true for source_name $1 after $max_retries retries."
+    fi
   else
       log-info "SKIPPED - ocp ingest, source_name: $1"
   fi
@@ -279,19 +306,16 @@ build_aws_data() {
 
   log-info "Building OpenShift on ${_source_name} report data..."
   nise_report ocp --static-report-file "$YAML_PATH/ocp_on_aws/rendered_ocp_static_data.yml" --ocp-cluster-id my-ocp-cluster-1 --minio-upload http://localhost:9000 --daily-reports --payload-name "$_ocp_payload"
-  # nise_report ocp --static-report-file "$YAML_PATH/ocp_on_aws/rendered_ocp_static_data.yml" --ocp-cluster-id my-ocp-cluster-1 --minio-upload http://localhost:9000 --payload-name "$_ocp_payload"
   nise_report aws --static-report-file "$YAML_PATH/ocp_on_aws/rendered_aws_static_data.yml" --aws-s3-report-name None --aws-s3-bucket-name "$NISE_DATA_PATH/local_providers/aws_local"
-
-  log-info "Cleanup ${_source_name} rendered YAML files..."
-  cleanup_rendered_files "${_rendered_yaml_files[@]}"
-
+  log-info "Trigger OCP download"
+  trigger_ocp_ingest "$_ocp_ingest_name" "$_ocp_payload"
   log-info "Adding ${_source_name} cost models..."
   add_cost_models 'Test OCP on AWS' openshift_on_aws_cost_model.json "$KOKU_API_HOSTNAME":"$KOKU_PORT"
   add_cost_models 'Test AWS Source' aws_cost_model.json "$KOKU_API_HOSTNAME":"$KOKU_PORT"
-
-  log-info "Trigger downloads..."
+  log-info "Trigger AWS download"
   trigger_download "${_download_types[@]}"
-  trigger_ocp_ingest "$_ocp_ingest_name" "$_ocp_payload"
+  log-info "Cleanup ${_source_name} rendered YAML files..."
+  cleanup_rendered_files "${_rendered_yaml_files[@]}"
 }
 
 # Azure customer data
@@ -315,9 +339,11 @@ build_azure_data() {
 
   log-info "Building OpenShift on ${_source_name} report data..."
   nise_report ocp --static-report-file "$YAML_PATH/ocp_on_azure/rendered_ocp_static_data.yml" --ocp-cluster-id my-ocp-cluster-2 --minio-upload http://localhost:9000 --daily-reports --payload-name "$_ocp_payload"
-  # nise_report ocp --static-report-file "$YAML_PATH/ocp_on_azure/rendered_ocp_static_data.yml" --ocp-cluster-id my-ocp-cluster-2 --minio-upload http://localhost:9000 --payload-name "$_ocp_payload"
   nise_report azure --static-report-file "$YAML_PATH/ocp_on_azure/rendered_azure_static_data.yml" --azure-container-name "$NISE_DATA_PATH/local_providers/azure_local" --azure-report-name azure-report
   nise_report azure --static-report-file "$YAML_PATH/rendered_azure_v2.yml" --azure-container-name "$NISE_DATA_PATH/local_providers/azure_local" --azure-report-name azure-report-v2 --version-two
+  log-info "Trigger OCP download"
+  trigger_ocp_ingest "$_ocp_ingest_name" "$_ocp_payload"
+
 
   log-info "Cleanup ${_source_name} rendered YAML files..."
   cleanup_rendered_files "${_rendered_yaml_files[@]}"
@@ -325,9 +351,8 @@ build_azure_data() {
   log-info "Adding ${_source_name} cost models..."
   add_cost_models 'Test Azure Source' azure_cost_model.json "$KOKU_API_HOSTNAME":"$KOKU_PORT"
 
-  log-info "Trigger downloads..."
+  log-info "Trigger Azure download..."
   trigger_download "${_download_types[@]}"
-  trigger_ocp_ingest "$_ocp_ingest_name" "$_ocp_payload"
 }
 
 # GCP customer data
@@ -351,9 +376,9 @@ build_gcp_data() {
 
   log-info "Building OpenShift on ${_source_name} report data..."
   nise_report ocp --static-report-file "$YAML_PATH/ocp_on_gcp/rendered_ocp_static_data.yml" --ocp-cluster-id test-ocp-gcp-cluster --minio-upload http://localhost:9000 --daily-reports --payload-name "$_ocp_payload"
-  # nise_report ocp --static-report-file "$YAML_PATH/ocp_on_gcp/rendered_ocp_static_data.yml" --ocp-cluster-id test-ocp-gcp-cluster --minio-upload http://localhost:9000 --payload-name "$_ocp_payload"
   nise_report gcp --static-report-file "$YAML_PATH/gcp/rendered_gcp_static_data.yml" --gcp-bucket-name "$NISE_DATA_PATH/local_providers/gcp_local"
   nise_report gcp --static-report-file "$YAML_PATH/ocp_on_gcp/rendered_gcp_static_data.yml" --gcp-bucket-name "$NISE_DATA_PATH/local_providers/gcp_local_0" -r
+  trigger_ocp_ingest "$_ocp_ingest_name" "$_ocp_payload"
 
   log-info "Cleanup ${_source_name} rendered YAML files..."
   cleanup_rendered_files "${_rendered_yaml_files[@]}"
@@ -363,7 +388,7 @@ build_gcp_data() {
 
   log-info "Trigger downloads..."
   trigger_download "${_download_types[@]}"
-  trigger_ocp_ingest "$_ocp_ingest_name" "$_ocp_payload"
+
 }
 
 # ONPREM customer data
